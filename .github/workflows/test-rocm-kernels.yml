@@ -112,25 +112,20 @@ jobs:
 
       - name: Install wheel and test dependencies
         run: |
-          # Resolve torch on the ROCm nightly index, then derive matching
-          # torchvision/torchaudio pins sharing the same +rocm build-date
-          # suffix. Without this, the vllm wheel's `torch==2.11.0` dep is
-          # satisfied by the vanilla PyPI wheel (PyTorch 2.11.0+cu130,
-          # HIP: None), and tests fail to find any GPU. See the build
-          # workflow for the same trick.
-          echo 'torch==2.11.*' > constraints.in
-          uv pip compile constraints.in \
-            --index-url ${{ env.PYTORCH_INDEX_URL }} \
-            --prerelease allow \
-            --no-header --no-annotate --no-deps \
-            -o constraints.txt
-          TORCH_LOCAL=$(grep '^torch==' constraints.txt | sed 's/.*+//')
-          TORCH_PATCH_SUFFIX=$(grep '^torch==' constraints.txt | sed 's/^torch==[0-9]\+\.[0-9]\+\.\([0-9]\+[^+]*\)+.*/\1/')
-          echo "torchvision==0.26.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
-          echo "torchaudio==2.11.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
-          cat constraints.txt
+          # constraints.txt comes from the wheel artifact (produced by the
+          # build workflow) so we pin to the exact torch/torchvision/
+          # torchaudio +rocm build the wheel was compiled against.
+          cat dist/constraints.txt
+          # Install ROCm runtime + the built wheel + test deps. Mirrors the
+          # build workflow's install except for `rocm[libraries]` instead of
+          # `rocm[devel,libraries]` (no hipcc needed at test time) and no
+          # `rocm-sdk init` (only rocm-sdk-devel ships a tarball that needs
+          # unpacking). See `.github/workflows/build-rocm-wheels.yml` for the
+          # rationale behind --index-strategy=unsafe-best-match and
+          # --prerelease=allow.
           uv pip install --system \
-            -c constraints.txt \
+            -c dist/constraints.txt \
+            "rocm[libraries]" \
             dist/*.whl \
             pytest pytest-timeout numpy \
             tblib transformers huggingface_hub sentencepiece pillow \
