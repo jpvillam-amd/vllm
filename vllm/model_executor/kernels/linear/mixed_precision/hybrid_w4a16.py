@@ -598,6 +598,30 @@ class HybridW4A16LinearKernel(MPLinearKernel):
             torch.nn.Parameter(w_q_skinny_i32, requires_grad=False),
         )
 
+        # ---- EXPERIMENT (not production): cache a dequantized bf16 copy of
+        # the weight so the prefill path can run a dense hipBLASLt GEMM and
+        # skip the in-kernel int4 unpack.  Decode still uses the int4 weights.
+        # Gated by VLLM_W4A16_PREFILL_BF16=1.  Costs ~4x extra memory for
+        # these weights -- experiment only.
+        import os
+
+        if (
+            os.environ.get("VLLM_W4A16_PREFILL_BF16", "0") == "1"
+            and unpacked.device.type == "cuda"
+        ):
+            G = c.group_size
+            u = unpacked.to(torch.float32)  # [N, K] natural order, nibble 0..15
+            scale_exp = w_s_skinny.to(torch.float32).repeat_interleave(G, dim=1)
+            if c.zero_points:
+                zp_exp = w_zp.to(torch.float32).repeat_interleave(G, dim=1)
+                w_bf16 = ((u - zp_exp) * scale_exp).to(c.act_type)
+            else:
+                w_bf16 = ((u - 8.0) * scale_exp).to(c.act_type)
+            layer.register_parameter(
+                "_hybrid_w_bf16",
+                torch.nn.Parameter(w_bf16.contiguous(), requires_grad=False),
+            )
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -613,6 +637,13 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         x_2d = x.reshape(-1, x.shape[-1])
         N = w_q.shape[0]
         out_shape = x.shape[:-1] + (N,)
+
+        # EXPERIMENT (not production): prefill uses the cached dequantized bf16
+        # weight + dense GEMM; decode (small M) falls through to the int4 path.
+        w_bf16 = getattr(layer, "_hybrid_w_bf16", None)
+        if w_bf16 is not None and x_2d.shape[0] > MAX_SKINNY_BATCH_SIZE:
+            out = torch.nn.functional.linear(x_2d, w_bf16, bias)
+            return out.reshape(out_shape)
 
         cu_count = num_compute_units()
         output = torch.ops.vllm.hybrid_w4a16_apply(
